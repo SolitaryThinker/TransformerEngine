@@ -29,6 +29,8 @@ from ..utils import (
     get_default_init_method,
     cast_if_needed,
     assert_dim_for_fp8_exec,
+    StatManager,
+    cuda_event,
 )
 from ..distributed import (
     set_tensor_model_parallel_attributes,
@@ -136,12 +138,13 @@ class _LayerNormLinear(torch.autograd.Function):
         if return_layernorm_output:
             ln_out_return = ln_out
             if fp8:
-                ln_out = tex.cast_to_fp8(
-                    ln_out,
-                    fp8_meta["scaling_fwd"],
-                    tex.FP8FwdTensors.GEMM1_INPUT,
-                    fp8_dtype_forward,
-                )
+                with cuda_event(quantize=True):
+                    ln_out = tex.cast_to_fp8(
+                        ln_out,
+                        fp8_meta["scaling_fwd"],
+                        tex.FP8FwdTensors.GEMM1_INPUT,
+                        fp8_dtype_forward,
+                    )
         # Column Parallel Linear
         if ub_split_ag or ub_atomic_gemm_ag:
             ln_out_total = ub_obj_lnout.get_ubuf_output(1)
@@ -161,21 +164,23 @@ class _LayerNormLinear(torch.autograd.Function):
 
             if update_fp8_weights:
                 if is_grad_enabled:
-                    tex.fp8_cast_transpose_fused(
-                        weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward,
-                        cast_out=weight_fp8,
-                        transpose_out=weight_t_fp8,
-                    )
+                    with cuda_event(quantize=True):
+                        tex.fp8_cast_transpose_fused(
+                            weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_WEIGHT,
+                            fp8_dtype_forward,
+                            cast_out=weight_fp8,
+                            transpose_out=weight_t_fp8,
+                        )
                 else:
                     weight_t_fp8 = None
-                    weight_fp8 = tex.cast_to_fp8(
-                        weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward)
+                    with cuda_event(quantize=True):
+                        weight_fp8 = tex.cast_to_fp8(
+                            weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_WEIGHT,
+                            fp8_dtype_forward)
 
             ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ub_split_ag else None
             ub_algo = tex.UbufOverlapAlgo.ATOMIC_GEMM_AG if ub_atomic_gemm_ag else ub_algo
@@ -435,13 +440,13 @@ class _LayerNormLinear(torch.autograd.Function):
                             extra_output_tensor=extra_output_tensor
                         )
                     else:
-                        ln_out_total_c = tex.cast_from_fp8(
-                            ln_out_total,
-                            ctx.fp8_meta["scaling_fwd"],
-                            tex.FP8FwdTensors.GEMM1_INPUT,
-                            fp8_dtype_forward,
-                            TE_DType[ctx.activation_dtype],
-                        )
+                        with cuda_event(quantize=False):
+                            ln_out_total_c = tex.cast_from_fp8( ln_out_total,
+                                ctx.fp8_meta["scaling_fwd"],
+                                tex.FP8FwdTensors.GEMM1_INPUT,
+                                fp8_dtype_forward,
+                                TE_DType[ctx.activation_dtype],
+                            )
                         wgrad, _, _ = tex.gemm(
                             ln_out_total_c,
                             grad_output,

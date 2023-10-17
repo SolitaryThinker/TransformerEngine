@@ -34,6 +34,10 @@ from ..cpp_extensions import (
     fp8_cast_transpose_bgrad_fused,
     cast_to_fp8,
 )
+from ..utils import(
+    StatManager,
+    cuda_event,
+)
 from ..constants import dist_group_type
 
 _2X_ACC_FPROP = False
@@ -672,13 +676,14 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 grad_output_c = ctx.ub_obj_gradout.get_ubuf_output(0)
             else:
                 grad_output_c = torch.empty_like(grad_output_mat, dtype=torch.uint8)
-            cast_to_fp8(
-                grad_output_mat,
-                ctx.fp8_meta["scaling_bwd"],
-                tex.FP8BwdTensors.GRAD_OUTPUT1,
-                fp8_dtype_backward,
-                out=grad_output_c,
-            )
+            with cuda_event(quantize=true):
+                cast_to_fp8(
+                    grad_output_mat,
+                    ctx.fp8_meta["scaling_bwd"],
+                    tex.FP8BwdTensors.GRAD_OUTPUT1,
+                    fp8_dtype_backward,
+                    out=grad_output_c,
+                )
             if not ub_overlap_ag:
                 grad_output_c, _ = gather_along_first_dim(grad_output_c, ctx.tp_group)
                 grad_output_t = tex.fp8_transpose(grad_output_c, fp8_dtype_backward)
@@ -690,28 +695,31 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
         # FP8 case without gather: cast, transpose, bgrad fused
         if ctx.use_bias:
-            grad_bias, grad_output_c, grad_output_t = fp8_cast_transpose_bgrad_fused(
-                grad_output_mat,
-                ctx.fp8_meta["scaling_bwd"],
-                tex.FP8BwdTensors.GRAD_OUTPUT1,
-                fp8_dtype_backward,
-            )
+            with cuda_event(quantize=True):
+                grad_bias, grad_output_c, grad_output_t = fp8_cast_transpose_bgrad_fused(
+                    grad_output_mat,
+                    ctx.fp8_meta["scaling_bwd"],
+                    tex.FP8BwdTensors.GRAD_OUTPUT1,
+                    fp8_dtype_backward,
+                )
         else:
             if not ctx.fp8_meta["recipe"].override_linear_precision.wgrad:
-                grad_output_c, grad_output_t = fp8_cast_transpose_fused(
-                    grad_output_mat,
-                    ctx.fp8_meta["scaling_bwd"],
-                    tex.FP8BwdTensors.GRAD_OUTPUT1,
-                    fp8_dtype_backward,
-                )
+                with cuda_event(quantize=True):
+                    grad_output_c, grad_output_t = fp8_cast_transpose_fused(
+                        grad_output_mat,
+                        ctx.fp8_meta["scaling_bwd"],
+                        tex.FP8BwdTensors.GRAD_OUTPUT1,
+                        fp8_dtype_backward,
+                    )
             else:
                 grad_output_t = None
-                grad_output_c = cast_to_fp8(
-                    grad_output_mat,
-                    ctx.fp8_meta["scaling_bwd"],
-                    tex.FP8BwdTensors.GRAD_OUTPUT1,
-                    fp8_dtype_backward,
-                )
+                with cuda_event(quantize=True):
+                    grad_output_c = cast_to_fp8(
+                        grad_output_mat,
+                        ctx.fp8_meta["scaling_bwd"],
+                        tex.FP8BwdTensors.GRAD_OUTPUT1,
+                        fp8_dtype_backward,
+                    )
             grad_bias = None
 
         return grad_output_mat, grad_output_c, grad_output_t, grad_bias

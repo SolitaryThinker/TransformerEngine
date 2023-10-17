@@ -26,6 +26,8 @@ from ..utils import (
     get_default_init_method,
     cast_if_needed,
     assert_dim_for_fp8_exec,
+    StatManager,
+    cuda_event,
 )
 from ..distributed import (
     set_tensor_model_parallel_attributes,
@@ -104,28 +106,30 @@ class _Linear(torch.autograd.Function):
         if fp8:
             fp8_dtype_forward = get_fp8_te_dtype(fp8_meta["recipe"], fprop_tensor=True)
 
-            if not fp8_meta["recipe"].override_linear_precision.wgrad:
-                if is_grad_enabled:
-                    inputmat, inputmat_t = fp8_cast_transpose_fused(
-                        inputmat,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_INPUT,
-                        fp8_dtype_forward,
-                    )
+
+            with cuda_event(quantize=True):
+                if not fp8_meta["recipe"].override_linear_precision.wgrad:
+                    if is_grad_enabled:
+                        inputmat, inputmat_t = fp8_cast_transpose_fused(
+                            inputmat,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_INPUT,
+                            fp8_dtype_forward,
+                        )
+                    else:
+                        inputmat = cast_to_fp8(
+                            inputmat,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_INPUT,
+                            fp8_dtype_forward,
+                        )
                 else:
-                    inputmat = cast_to_fp8(
+                    inputmat, inputmat_t = cast_to_fp8(
                         inputmat,
                         fp8_meta["scaling_fwd"],
                         tex.FP8FwdTensors.GEMM1_INPUT,
                         fp8_dtype_forward,
-                    )
-            else:
-                inputmat, inputmat_t = cast_to_fp8(
-                    inputmat,
-                    fp8_meta["scaling_fwd"],
-                    tex.FP8FwdTensors.GEMM1_INPUT,
-                    fp8_dtype_forward,
-                ), None
+                    ), None
 
         # Column Parallel Linear
         if parallel_mode == "column" and sequence_parallel:
@@ -141,24 +145,25 @@ class _Linear(torch.autograd.Function):
             )
             bias = cast_if_needed(bias, bias_dtype) if use_bias else bias
 
-            if update_fp8_weights:
-                if is_grad_enabled:
-                    fp8_cast_transpose_fused(
-                        weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward,
-                        cast_out=weight_fp8,
-                        transpose_out=weight_t_fp8,
-                    )
-                else:
-                    weight_t_fp8 = None
-                    weight_fp8 = cast_to_fp8(
-                        weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward,
-                    )
+            with cuda_event(quantize=True):
+                if update_fp8_weights:
+                    if is_grad_enabled:
+                        fp8_cast_transpose_fused(
+                            weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_WEIGHT,
+                            fp8_dtype_forward,
+                            cast_out=weight_fp8,
+                            transpose_out=weight_t_fp8,
+                        )
+                    else:
+                        weight_t_fp8 = None
+                        weight_fp8 = cast_to_fp8(
+                            weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_WEIGHT,
+                            fp8_dtype_forward,
+                        )
 
             proj_out_index, meta_tensor, proj_out_tetype, proj_out_pttype = (
                 None, None, None, activation_dtype)

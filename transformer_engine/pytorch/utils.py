@@ -6,6 +6,43 @@
 import math
 from typing import Any, Callable, Optional, Tuple
 import torch
+from contextlib import contextmanager
+
+
+class StatManager:
+    FP8_QUANTIZE_TIME = 0
+    FP8_DEQUANTIZE_TIME = 0
+
+    @classmethod
+    def reset_fp8_time(cls):
+        cls.FP8_QUANTIZE_TIME = 0
+        cls.FP8_DEQUANTIZE_TIME = 0
+
+    @classmethod
+    def get_fp8_quantize_time(cls):
+        return cls.FP8_QUANTIZE_TIME
+
+    @classmethod
+    def get_fp8_dequantize_time(cls):
+        return cls.FP8_DEQUANTIZE_TIME
+
+@contextmanager
+def cuda_event(*args, **kwds):
+    start = torch.cuda.Event(enable_time=True)
+    end = torch.cuda.Event(enable_time=True)
+    try:
+        start.record()
+        yield
+    finally:
+        end.record()
+        torch.cuda.synchronize()
+        if kwds['quantize'] == True:
+            StatManager.FP8_QUANTIZE_TIME += start.elapsed_time(end)
+        else:
+            StatManager.FP8_DEQUANTIZE_TIME += start.elapsed_time(end)
+
+
+
 
 
 def get_device_compute_capability() -> Tuple[int, int]:

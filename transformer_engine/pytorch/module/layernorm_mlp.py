@@ -32,6 +32,8 @@ from ..utils import (
     get_default_init_method,
     cast_if_needed,
     assert_dim_for_fp8_exec,
+    StatManager,
+    cuda_event,
 )
 from ..distributed import (
     set_tensor_model_parallel_attributes,
@@ -172,12 +174,13 @@ class _LayerNormMLP(torch.autograd.Function):
         if return_layernorm_output:
             ln_out_return = ln_out
             if fp8:
-                ln_out = tex.cast_to_fp8(
-                    ln_out,
-                    fp8_meta["scaling_fwd"],
-                    tex.FP8FwdTensors.GEMM1_INPUT,
-                    fp8_dtype_forward,
-                )
+                with cuda_event(quantize=True):
+                    ln_out = tex.cast_to_fp8(
+                        ln_out,
+                        fp8_meta["scaling_fwd"],
+                        tex.FP8FwdTensors.GEMM1_INPUT,
+                        fp8_dtype_forward,
+                    )
         # Column Parallel Linear
         if ub_overlap_ag:
             ln_out_total = ub_obj_lnout.get_ubuf_output(1)
@@ -197,39 +200,40 @@ class _LayerNormMLP(torch.autograd.Function):
             fc2_bias = cast_if_needed(fc2_bias, bias_dtype) if use_fc2_bias else fc2_bias
 
             if update_fp8_weights:
-                if is_grad_enabled:
-                    tex.fp8_cast_transpose_fused(
-                        fc1_weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward,
-                        cast_out=fc1_weight_fp8,
-                        transpose_out=fc1_weight_t_fp8,
-                    )
+                with cuda_event(quantize=True):
+                    if is_grad_enabled:
+                        tex.fp8_cast_transpose_fused(
+                            fc1_weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_WEIGHT,
+                            fp8_dtype_forward,
+                            cast_out=fc1_weight_fp8,
+                            transpose_out=fc1_weight_t_fp8,
+                        )
 
-                    tex.fp8_cast_transpose_fused(
-                        fc2_weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM2_WEIGHT,
-                        fp8_dtype_forward,
-                        cast_out=fc2_weight_fp8,
-                        transpose_out=fc2_weight_t_fp8,
-                    )
-                else:
-                    fc1_weight_t_fp8 = None
-                    fc1_weight_fp8 = tex.cast_to_fp8(
-                        fc1_weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward,
-                    )
-                    fc2_weight_t_fp8 = None
-                    fc2_weight_fp8 = tex.cast_to_fp8(
-                        fc2_weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM2_WEIGHT,
-                        fp8_dtype_forward,
-                    )
+                        tex.fp8_cast_transpose_fused(
+                            fc2_weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM2_WEIGHT,
+                            fp8_dtype_forward,
+                            cast_out=fc2_weight_fp8,
+                            transpose_out=fc2_weight_t_fp8,
+                        )
+                    else:
+                        fc1_weight_t_fp8 = None
+                        fc1_weight_fp8 = tex.cast_to_fp8(
+                            fc1_weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_WEIGHT,
+                            fp8_dtype_forward,
+                        )
+                        fc2_weight_t_fp8 = None
+                        fc2_weight_fp8 = tex.cast_to_fp8(
+                            fc2_weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM2_WEIGHT,
+                            fp8_dtype_forward,
+                        )
 
             ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ub_split_ag else None
             ub_algo = tex.UbufOverlapAlgo.ATOMIC_GEMM_AG if ub_atomic_gemm_ag else ub_algo
@@ -569,31 +573,34 @@ class _LayerNormMLP(torch.autograd.Function):
                         )
 
                     if ctx.activation == 'gelu':
-                        fc1_bias_grad, dgelu, dgelu_t = tex.fp8_cast_transpose_bgrad_dgelu_fused(
-                            fc2_dgrad,
-                            fc1_out,
-                            ctx.fp8_meta["scaling_bwd"],
-                            tex.FP8BwdTensors.GRAD_OUTPUT2,
-                            fp8_dtype_backward,
-                        )
+                        with cuda_event(quantize=True):
+                            fc1_bias_grad, dgelu, dgelu_t = tex.fp8_cast_transpose_bgrad_dgelu_fused(
+                                fc2_dgrad,
+                                fc1_out,
+                                ctx.fp8_meta["scaling_bwd"],
+                                tex.FP8BwdTensors.GRAD_OUTPUT2,
+                                fp8_dtype_backward,
+                            )
                     else:
                         dgelu = activation_func(fc2_dgrad, fc1_out,
                                                 TE_DType[fc2_dgrad.dtype])
-                        fc1_bias_grad, dgelu, dgelu_t = tex.fp8_cast_transpose_bgrad_fused(
-                            dgelu,
-                            ctx.fp8_meta["scaling_bwd"],
-                            tex.FP8BwdTensors.GRAD_OUTPUT2,
-                            fp8_dtype_backward,
-                        )
+                        with cuda_event(quantize=True):
+                            fc1_bias_grad, dgelu, dgelu_t = tex.fp8_cast_transpose_bgrad_fused(
+                                dgelu,
+                                ctx.fp8_meta["scaling_bwd"],
+                                tex.FP8BwdTensors.GRAD_OUTPUT2,
+                                fp8_dtype_backward,
+                            )
                 else:
                     if fc2_weight.requires_grad:
-                        gelu_out_c = tex.cast_from_fp8(
-                            gelu_out,
-                            ctx.fp8_meta["scaling_fwd"],
-                            tex.FP8FwdTensors.GEMM2_INPUT,
-                            fp8_dtype_forward,
-                            TE_DType[ctx.activation_dtype],
-                        )
+                        with cuda_event(quantize=False):
+                            gelu_out_c = tex.cast_from_fp8(
+                                gelu_out,
+                                ctx.fp8_meta["scaling_fwd"],
+                                tex.FP8FwdTensors.GEMM2_INPUT,
+                                fp8_dtype_forward,
+                                TE_DType[ctx.activation_dtype],
+                            )
                         fc2_wgrad, _, _ = tex.gemm(
                             gelu_out_c,
                             grad_output,
@@ -618,12 +625,13 @@ class _LayerNormMLP(torch.autograd.Function):
                                                        TE_DType[fc2_dgrad.dtype])
                         fc1_bias_grad = dgelu_no_fp8.sum(dim=0)
 
-                    dgelu = tex.cast_to_fp8(
-                        dgelu_no_fp8,
-                        ctx.fp8_meta["scaling_bwd"],
-                        tex.FP8BwdTensors.GRAD_OUTPUT2,
-                        fp8_dtype_backward,
-                    )
+                    with cuda_event(quantize=True):
+                        dgelu = tex.cast_to_fp8(
+                            dgelu_no_fp8,
+                            ctx.fp8_meta["scaling_bwd"],
+                            tex.FP8BwdTensors.GRAD_OUTPUT2,
+                            fp8_dtype_backward,
+                        )
                     dgelu_t = None
 
                 out_index, meta_tensor, out_te_type, out_type = (
@@ -778,13 +786,14 @@ class _LayerNormMLP(torch.autograd.Function):
                             extra_output_tensor=extra_output_tensor,
                         )
                     else:
-                        ln_out_total_c = tex.cast_from_fp8(
-                            ln_out_total,
-                            ctx.fp8_meta["scaling_fwd"],
-                            tex.FP8FwdTensors.GEMM1_INPUT,
-                            fp8_dtype_forward,
-                            TE_DType[ctx.activation_dtype],
-                        )
+                        with cuda_event(quantize=False):
+                            ln_out_total_c = tex.cast_from_fp8(
+                                ln_out_total,
+                                ctx.fp8_meta["scaling_fwd"],
+                                tex.FP8FwdTensors.GEMM1_INPUT,
+                                fp8_dtype_forward,
+                                TE_DType[ctx.activation_dtype],
+                            )
                         fc1_wgrad, _, _ = tex.gemm(
                             ln_out_total_c,
                             dgelu_no_fp8,
